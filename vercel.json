@@ -1,4 +1,4 @@
 {
-  "installCommand": "apt-get update && apt-get install -y cmake && pnpm install",
+  "installCommand": "curl -L https://github.com/Kitware/CMake/releases/download/v3.31.9/cmake-3.31.9-linux-x86_64.tar.gz | tar -xzf - && PATH=\"$(pwd)/cmake-3.31.9-linux-x86_64/bin:$PATH\" pnpm install",
   "buildCommand": "pnpm build"
 }
