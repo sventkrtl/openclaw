@@ -1,0 +1,4 @@
+{
+  "installCommand": "apt-get update && apt-get install -y cmake && pnpm install",
+  "buildCommand": "pnpm build"
+}
