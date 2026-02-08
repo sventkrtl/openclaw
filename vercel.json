@@ -1,4 +1,8 @@
 {
   "installCommand": "curl -L https://github.com/Kitware/CMake/releases/download/v3.31.9/cmake-3.31.9-linux-x86_64.tar.gz | tar -xzf - && PATH=\"$(pwd)/cmake-3.31.9-linux-x86_64/bin:$PATH\" pnpm install",
-  "buildCommand": "pnpm build"
+  "buildCommand": "pnpm build",
+  "build": {
+    "outputDirectory": "dist/control-ui"
+  },
+  "framework": "vite"
 }
