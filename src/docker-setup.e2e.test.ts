@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,14 +19,23 @@ async function writeDockerStub(binDir: string, logPath: string) {
   const stub = `#!/usr/bin/env bash
 set -euo pipefail
 log="$DOCKER_STUB_LOG"
+fail_match="\${DOCKER_STUB_FAIL_MATCH:-}"
 if [[ "\${1:-}" == "compose" && "\${2:-}" == "version" ]]; then
   exit 0
 fi
 if [[ "\${1:-}" == "build" ]]; then
+  if [[ -n "$fail_match" && "$*" == *"$fail_match"* ]]; then
+    echo "build-fail $*" >>"$log"
+    exit 1
+  fi
   echo "build $*" >>"$log"
   exit 0
 fi
 if [[ "\${1:-}" == "compose" ]]; then
+  if [[ -n "$fail_match" && "$*" == *"$fail_match"* ]]; then
+    echo "compose-fail $*" >>"$log"
+    exit 1
+  fi
   echo "compose $*" >>"$log"
   exit 0
 fi
@@ -103,6 +113,30 @@ function runDockerSetup(
   });
 }
 
+async function withUnixSocket<T>(socketPath: string, run: () => Promise<T>): Promise<T> {
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(socketPath);
+  });
+
+  try {
+    return await run();
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(socketPath, { force: true });
+  }
+}
+
 function resolveBashForCompatCheck(): string | null {
   for (const candidate of ["/bin/bash", "bash"]) {
     const probe = spawnSync(candidate, ["-c", "exit 0"], { encoding: "utf8" });
@@ -129,7 +163,7 @@ describe("docker-setup.sh", () => {
     sandbox = null;
   });
 
-  it("handles env defaults, home-volume mounts, and apt build args", async () => {
+  it("handles env defaults, home-volume mounts, and Docker build args", async () => {
     const activeSandbox = requireSandbox(sandbox);
 
     const result = runDockerSetup(activeSandbox, {
@@ -141,7 +175,7 @@ describe("docker-setup.sh", () => {
     const envFile = await readFile(join(activeSandbox.rootDir, ".env"), "utf8");
     expect(envFile).toContain("OPENCLAW_DOCKER_APT_PACKAGES=ffmpeg build-essential");
     expect(envFile).toContain("OPENCLAW_EXTRA_MOUNTS=");
-    expect(envFile).toContain("OPENCLAW_HOME_VOLUME=openclaw-home");
+    expect(envFile).toContain("OPENCLAW_HOME_VOLUME=openclaw-home"); // pragma: allowlist secret
     const extraCompose = await readFile(
       join(activeSandbox.rootDir, "docker-compose.extra.yml"),
       "utf8",
@@ -213,7 +247,135 @@ describe("docker-setup.sh", () => {
 
     expect(result.status).toBe(0);
     const envFile = await readFile(join(activeSandbox.rootDir, ".env"), "utf8");
-    expect(envFile).toContain("OPENCLAW_GATEWAY_TOKEN=config-token-123");
+    expect(envFile).toContain("OPENCLAW_GATEWAY_TOKEN=config-token-123"); // pragma: allowlist secret
+  });
+
+  it("reuses existing .env token when OPENCLAW_GATEWAY_TOKEN and config token are unset", async () => {
+    const activeSandbox = requireSandbox(sandbox);
+    const configDir = join(activeSandbox.rootDir, "config-dotenv-token-reuse");
+    const workspaceDir = join(activeSandbox.rootDir, "workspace-dotenv-token-reuse");
+    await mkdir(configDir, { recursive: true });
+    await writeFile(
+      join(activeSandbox.rootDir, ".env"),
+      "OPENCLAW_GATEWAY_TOKEN=dotenv-token-123\nOPENCLAW_GATEWAY_PORT=18789\n", // pragma: allowlist secret
+    );
+
+    const result = runDockerSetup(activeSandbox, {
+      OPENCLAW_GATEWAY_TOKEN: undefined,
+      OPENCLAW_CONFIG_DIR: configDir,
+      OPENCLAW_WORKSPACE_DIR: workspaceDir,
+    });
+
+    expect(result.status).toBe(0);
+    const envFile = await readFile(join(activeSandbox.rootDir, ".env"), "utf8");
+    expect(envFile).toContain("OPENCLAW_GATEWAY_TOKEN=dotenv-token-123"); // pragma: allowlist secret
+    expect(result.stderr).toBe("");
+  });
+
+  it("reuses the last non-empty .env token and strips CRLF without truncating '='", async () => {
+    const activeSandbox = requireSandbox(sandbox);
+    const configDir = join(activeSandbox.rootDir, "config-dotenv-last-wins");
+    const workspaceDir = join(activeSandbox.rootDir, "workspace-dotenv-last-wins");
+    await mkdir(configDir, { recursive: true });
+    await writeFile(
+      join(activeSandbox.rootDir, ".env"),
+      [
+        "OPENCLAW_GATEWAY_TOKEN=",
+        "OPENCLAW_GATEWAY_TOKEN=first-token",
+        "OPENCLAW_GATEWAY_TOKEN=last=token=value\r", // pragma: allowlist secret
+      ].join("\n"),
+    );
+
+    const result = runDockerSetup(activeSandbox, {
+      OPENCLAW_GATEWAY_TOKEN: undefined,
+      OPENCLAW_CONFIG_DIR: configDir,
+      OPENCLAW_WORKSPACE_DIR: workspaceDir,
+    });
+
+    expect(result.status).toBe(0);
+    const envFile = await readFile(join(activeSandbox.rootDir, ".env"), "utf8");
+    expect(envFile).toContain("OPENCLAW_GATEWAY_TOKEN=last=token=value"); // pragma: allowlist secret
+    expect(envFile).not.toContain("OPENCLAW_GATEWAY_TOKEN=first-token");
+    expect(envFile).not.toContain("\r");
+  });
+
+  it("treats OPENCLAW_SANDBOX=0 as disabled", async () => {
+    const activeSandbox = requireSandbox(sandbox);
+    await writeFile(activeSandbox.logPath, "");
+
+    const result = runDockerSetup(activeSandbox, {
+      OPENCLAW_SANDBOX: "0",
+    });
+
+    expect(result.status).toBe(0);
+    const envFile = await readFile(join(activeSandbox.rootDir, ".env"), "utf8");
+    expect(envFile).toContain("OPENCLAW_SANDBOX=");
+
+    const log = await readFile(activeSandbox.logPath, "utf8");
+    expect(log).toContain("--build-arg OPENCLAW_INSTALL_DOCKER_CLI=");
+    expect(log).not.toContain("--build-arg OPENCLAW_INSTALL_DOCKER_CLI=1");
+    expect(log).toContain("config set agents.defaults.sandbox.mode off");
+  });
+
+  it("resets stale sandbox mode and overlay when sandbox is not active", async () => {
+    const activeSandbox = requireSandbox(sandbox);
+    await writeFile(activeSandbox.logPath, "");
+    await writeFile(
+      join(activeSandbox.rootDir, "docker-compose.sandbox.yml"),
+      "services:\n  openclaw-gateway:\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n",
+    );
+
+    const result = runDockerSetup(activeSandbox, {
+      OPENCLAW_SANDBOX: "1",
+      DOCKER_STUB_FAIL_MATCH: "--entrypoint docker openclaw-gateway --version",
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain("Sandbox requires Docker CLI");
+    const log = await readFile(activeSandbox.logPath, "utf8");
+    expect(log).toContain("config set agents.defaults.sandbox.mode off");
+    await expect(stat(join(activeSandbox.rootDir, "docker-compose.sandbox.yml"))).rejects.toThrow();
+  });
+
+  it("skips sandbox gateway restart when sandbox config writes fail", async () => {
+    const activeSandbox = requireSandbox(sandbox);
+    await writeFile(activeSandbox.logPath, "");
+    const socketPath = join(activeSandbox.rootDir, "sandbox.sock");
+
+    await withUnixSocket(socketPath, async () => {
+      const result = runDockerSetup(activeSandbox, {
+        OPENCLAW_SANDBOX: "1",
+        OPENCLAW_DOCKER_SOCKET: socketPath,
+        DOCKER_STUB_FAIL_MATCH: "config set agents.defaults.sandbox.scope",
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain("Failed to set agents.defaults.sandbox.scope");
+      expect(result.stderr).toContain("Skipping gateway restart to avoid exposing Docker socket");
+
+      const log = await readFile(activeSandbox.logPath, "utf8");
+      const gatewayStarts = log
+        .split("\n")
+        .filter(
+          (line) =>
+            line.includes("compose") &&
+            line.includes(" up -d") &&
+            line.includes("openclaw-gateway"),
+        );
+      expect(gatewayStarts).toHaveLength(2);
+      expect(log).toContain(
+        "run --rm --no-deps openclaw-cli config set agents.defaults.sandbox.mode non-main",
+      );
+      expect(log).toContain("config set agents.defaults.sandbox.mode off");
+      const forceRecreateLine = log
+        .split("\n")
+        .find((line) => line.includes("up -d --force-recreate openclaw-gateway"));
+      expect(forceRecreateLine).toBeDefined();
+      expect(forceRecreateLine).not.toContain("docker-compose.sandbox.yml");
+      await expect(
+        stat(join(activeSandbox.rootDir, "docker-compose.sandbox.yml")),
+      ).rejects.toThrow();
+    });
   });
 
   it("rejects injected multiline OPENCLAW_EXTRA_MOUNTS values", async () => {
@@ -285,5 +447,12 @@ describe("docker-setup.sh", () => {
     const compose = await readFile(join(repoRoot, "docker-compose.yml"), "utf8");
     expect(compose).toContain('network_mode: "service:openclaw-gateway"');
     expect(compose).toContain("depends_on:\n      - openclaw-gateway");
+  });
+
+  it("keeps docker-compose gateway token env defaults aligned across services", async () => {
+    const compose = await readFile(join(repoRoot, "docker-compose.yml"), "utf8");
+    expect(compose.match(/OPENCLAW_GATEWAY_TOKEN: \$\{OPENCLAW_GATEWAY_TOKEN:-\}/g)).toHaveLength(
+      2,
+    );
   });
 });
