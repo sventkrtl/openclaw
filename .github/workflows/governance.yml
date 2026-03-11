@@ -1,0 +1,304 @@
+name: Governance Enforcement
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: governance-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ── Domain 1–3: Tool Authority, Sandbox Isolation, Exec Security ──
+  # ── Domain 5–7: Governance Integrity, Secret Redaction, Supply Chain ──
+  policy-invariants:
+    name: Policy Invariants
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          install-bun: "true"
+          use-sticky-disk: "false"
+
+      - name: Run governance policy checks
+        run: bunx tsx scripts/governance-check.ts
+
+  # ── Domain 4: Communication Safety ──────────────────────────────────
+  communication-safety:
+    name: Communication Safety
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: No auto-approve for message tool
+        run: |
+          set -euo pipefail
+
+          # message tool must NOT appear in any safe-auto-approve or auto-allow set
+          if grep -rn 'SAFE_AUTO_APPROVE' src/ | grep -q '"message"'; then
+            echo "::error::message tool must not be in SAFE_AUTO_APPROVE_TOOL_IDS"
+            exit 1
+          fi
+
+          # Outbound message pipeline should not bypass approval entirely
+          # Check that message-action-runner doesn't skip permission checks
+          if grep -rn 'skipApproval.*true\|bypassPermission.*true' src/infra/outbound/ 2>/dev/null; then
+            echo "::warning::Outbound message pipeline may bypass approval — review manually"
+          fi
+
+          echo "✅ Communication safety: message tool not auto-approved"
+
+  # ── Domain 5: Automation Scope ──────────────────────────────────────
+  automation-scope:
+    name: Automation Scope
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify cron + sessions_spawn stay gated
+        run: |
+          set -euo pipefail
+          ok=true
+
+          # sessions_spawn and cron must remain in gateway HTTP deny list
+          deny_file="src/security/dangerous-tools.ts"
+          for tool in sessions_spawn cron; do
+            if ! grep -q "\"$tool\"" "$deny_file"; then
+              echo "::error file=$deny_file::DEFAULT_GATEWAY_HTTP_TOOL_DENY missing: $tool"
+              ok=false
+            fi
+          done
+
+          # Verify cron gating — cron execution should check config enablement
+          if [ -d src/cron ]; then
+            cron_files=$(find src/cron -name '*.ts' -not -name '*.test.ts' | head -20)
+            has_gate=false
+            for f in $cron_files; do
+              if grep -q 'cronEnabled\|cron.*enabled\|isCronEnabled' "$f"; then
+                has_gate=true
+                break
+              fi
+            done
+            if [ "$has_gate" = false ]; then
+              echo "::warning::No explicit cron enablement gate found in src/cron/"
+            fi
+          fi
+
+          $ok && echo "✅ Automation scope: cron and sessions_spawn properly gated"
+
+  # ── Domain 6: Governance File Protection ────────────────────────────
+  protected-files:
+    name: Protected File Monitor
+    if: github.event_name == 'pull_request'
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check protected file changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          # Files that require explicit review when modified
+          protected_files=(
+            "AI_OPERATIONS_GOVERNANCE.md"
+            "SECURITY.md"
+            "src/security/dangerous-tools.ts"
+            "src/acp/client.ts"
+            "src/agents/sandbox/validate-sandbox-security.ts"
+            "src/agents/sandbox/tool-policy.ts"
+            "src/config/types.tools.ts"
+            "src/agents/tool-catalog.ts"
+            "src/logging/redact.ts"
+            "scripts/governance-check.ts"
+            ".github/workflows/governance.yml"
+            "Dockerfile"
+            "Dockerfile.sandbox"
+            "Dockerfile.sandbox-common"
+            "docker-compose.yml"
+          )
+
+          changed=$(git diff --name-only "$BASE_SHA"...HEAD)
+          flagged=()
+
+          for pf in "${protected_files[@]}"; do
+            if echo "$changed" | grep -qF "$pf"; then
+              flagged+=("$pf")
+            fi
+          done
+
+          if [ ${#flagged[@]} -gt 0 ]; then
+            echo "::warning::Governance-protected files modified in this PR:"
+            for f in "${flagged[@]}"; do
+              echo "  ⚠ $f"
+              echo "::warning file=$f::Governance-protected file modified — requires explicit review"
+            done
+            echo ""
+            echo "These files affect security controls, sandbox configuration, or governance policy."
+            echo "Ensure changes are reviewed against AI_OPERATIONS_GOVERNANCE.md requirements."
+          else
+            echo "✅ No governance-protected files modified"
+          fi
+
+  # ── Domain 7: Dependency Safety ─────────────────────────────────────
+  dependency-safety:
+    name: Dependency Safety
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify Docker image pinning
+        run: |
+          set -euo pipefail
+          ok=true
+
+          for df in Dockerfile Dockerfile.sandbox Dockerfile.sandbox-common; do
+            [ -f "$df" ] || continue
+            while IFS= read -r line; do
+              trimmed=$(echo "$line" | sed 's/^[[:space:]]*//')
+              # Skip ARG-based, scratch, and builder-stage FROM
+              echo "$trimmed" | grep -qiE '^FROM\s+(scratch|\$)' && continue
+              if ! echo "$trimmed" | grep -q '@sha256:'; then
+                echo "::error file=$df::Unpinned base image: $trimmed"
+                ok=false
+              fi
+            done < <(grep -iE '^\s*FROM\s' "$df")
+          done
+
+          $ok && echo "✅ All Dockerfile base images are SHA-pinned"
+
+      - name: Verify patched dependencies use exact versions
+        run: |
+          set -euo pipefail
+
+          # Any dependency with pnpm.patchedDependencies must use exact version (no ^/~)
+          if [ -f package.json ]; then
+            patched=$(node -e "
+              const pkg = require('./package.json');
+              const patched = pkg.pnpm?.patchedDependencies || {};
+              for (const key of Object.keys(patched)) {
+                // key format: 'pkg@version'
+                const at = key.lastIndexOf('@');
+                if (at > 0) {
+                  const name = key.substring(0, at);
+                  const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+                  const ver = deps[name];
+                  if (ver && (ver.startsWith('^') || ver.startsWith('~'))) {
+                    console.log(name + ':' + ver);
+                  }
+                }
+              }
+            " 2>/dev/null || true)
+
+            if [ -n "$patched" ]; then
+              echo "::error::Patched dependencies with non-exact versions:"
+              echo "$patched" | while IFS=: read -r name ver; do
+                echo "  ✗ $name: $ver (must be exact, no ^/~)"
+              done
+              exit 1
+            fi
+          fi
+
+          echo "✅ Patched dependencies use exact versions"
+
+  # ── Domain 8: Network Exposure Guard ──────────────────────────────────
+  network-exposure:
+    name: Network Exposure Guard
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect network exposure risks
+        run: |
+          set -euo pipefail
+          ok=true
+
+          # Check for --network=host or network_mode: host in Docker files
+          for f in Dockerfile Dockerfile.sandbox Dockerfile.sandbox-common docker-compose.yml; do
+            [ -f "$f" ] || continue
+            if grep -qiE 'network_mode:\s*host|--network=host|--net=host' "$f"; then
+              echo "::error file=$f::Host networking detected — breaks sandbox isolation"
+              ok=false
+            fi
+          done
+
+          # Check for public bind addresses (0.0.0.0) in docker-compose
+          if [ -f docker-compose.yml ]; then
+            if grep -nE '["'\'']*0\.0\.0\.0:' docker-compose.yml; then
+              echo "::error file=docker-compose.yml::Public bind address 0.0.0.0 detected — use 127.0.0.1"
+              ok=false
+            fi
+          fi
+
+          # Check for new EXPOSE directives in sandbox Dockerfiles (sandbox should not expose ports)
+          for f in Dockerfile.sandbox Dockerfile.sandbox-common; do
+            [ -f "$f" ] || continue
+            if grep -qiE '^\s*EXPOSE\s' "$f"; then
+              echo "::warning file=$f::EXPOSE directive in sandbox Dockerfile — review if intentional"
+            fi
+          done
+
+          $ok && echo "✅ Network exposure guard: no host networking or public binds detected"
+
+  # ── Domain 9: Autonomy Escalation Guard ─────────────────────────────
+  autonomy-escalation:
+    name: Autonomy Escalation Guard
+    if: github.event_name == 'pull_request'
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan diff for autonomy escalation flags
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          # Patterns that indicate unsupervised autonomous execution
+          patterns=(
+            'auto[_-]?execute'
+            'autonomous[_-]?mode'
+            'unattended[_-]?run'
+            'background[_-]?actions'
+            'schedule[_-]?execute'
+            'self[_-]?approve'
+            'bypass[_-]?approval'
+            'skip[_-]?human'
+          )
+
+          diff=$(git diff "$BASE_SHA"...HEAD -- '*.ts' '*.json' '*.yml' '*.yaml' || true)
+          flagged=false
+
+          for pat in "${patterns[@]}"; do
+            # Only flag additions (+ lines in diff)
+            matches=$(echo "$diff" | grep -iE "^\+.*$pat" || true)
+            if [ -n "$matches" ]; then
+              echo "::warning::Autonomy escalation pattern detected: $pat"
+              echo "$matches" | head -5
+              flagged=true
+            fi
+          done
+
+          if [ "$flagged" = true ]; then
+            echo ""
+            echo "⚠ Autonomy escalation flags found in this PR."
+            echo "Ensure these are explicitly approved per AI_OPERATIONS_GOVERNANCE.md §10."
+          else
+            echo "✅ Autonomy escalation guard: no unsupervised execution flags detected"
+          fi
